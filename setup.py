@@ -43,6 +43,7 @@ setup(
         "Topic :: Software Development :: Libraries"
     ],
     install_requires=[
+        "wheel>=0.31.0",
         "requests>=2.18.4",
         "six>=1.11.0",
         "pyOpenSSL>=17.5.0",
