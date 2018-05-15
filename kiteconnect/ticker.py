@@ -8,18 +8,30 @@
     :license: see LICENSE for details.
 """
 import six
+import txaio
+# import signal
 import sys
 import time
 import json
+import ssl
 import struct
 import logging
 import threading
 from datetime import datetime
-from twisted.internet import reactor, ssl
-from twisted.python import log as twisted_log
-from twisted.internet.protocol import ReconnectingClientFactory
-from autobahn.twisted.websocket import WebSocketClientProtocol, \
-    WebSocketClientFactory, connectWS
+# from twisted.internet import reactor, ssl
+# from twisted.python import log as twisted_log
+# from twisted.internet.protocol import ReconnectingClientFactory
+# from autobahn.twisted.websocket import WebSocketClientProtocol, \
+#     WebSocketClientFactory, connectWS
+
+from autobahn.asyncio.websocket import WebSocketClientFactory, WebSocketClientProtocol
+
+try:
+    import asyncio
+except ImportError:
+    # Trollius >= 0.3 was renamed
+    import trollius as asyncio
+
 
 from .__version__ import __version__, __title__
 
@@ -51,7 +63,7 @@ class KiteTickerClientProtocol(WebSocketClientProtocol):
             self.factory.on_connect(self, response)
 
         # Reset reconnect on successful reconnect
-        self.factory.resetDelay()
+        self.factory.reset_delay()
 
     # Overide method
     def onOpen(self):  # noqa
@@ -73,6 +85,7 @@ class KiteTickerClientProtocol(WebSocketClientProtocol):
     # Overide method
     def onClose(self, was_clean, code, reason):  # noqa
         """Called when connection is closed."""
+        print("on close: ", was_clean, code, reason)
         if not was_clean:
             if self.factory.on_error:
                 self.factory.on_error(self, code, reason)
@@ -89,6 +102,8 @@ class KiteTickerClientProtocol(WebSocketClientProtocol):
 
         if self._next_pong_check:
             self._next_pong_check.cancel()
+
+        self.factory.loop.stop()
 
     def onPong(self, response):  # noqa
         """Called when pong message is received."""
@@ -116,7 +131,7 @@ class KiteTickerClientProtocol(WebSocketClientProtocol):
         self.sendPing(self._ping_message)
 
         # Call self after X seconds
-        self._next_ping = self.factory.reactor.callLater(self.PING_INTERVAL, self._loop_ping)
+        self._next_ping = self.factory.loop.call_later(self.PING_INTERVAL, self._loop_ping)
 
     def _loop_pong_check(self):
         """
@@ -124,6 +139,8 @@ class KiteTickerClientProtocol(WebSocketClientProtocol):
 
         Checks last pong message time and disconnects the existing connection to make sure it doesn't become a ghost connection.
         """
+        drop_connection = False
+
         if self._last_pong_time:
             # No pong message since long time, so init reconnect
             last_pong_diff = time.time() - self._last_pong_time
@@ -133,19 +150,25 @@ class KiteTickerClientProtocol(WebSocketClientProtocol):
                         last_pong_diff))
                 # drop existing connection to avoid ghost connection
                 self.dropConnection(abort=True)
+                drop_connection = True
 
-        # Call self after X seconds
-        self._next_pong_check = self.factory.reactor.callLater(self.PING_INTERVAL, self._loop_pong_check)
+        if not drop_connection:
+            # Call self after X seconds
+            self._next_pong_check = self.factory.loop.call_later(self.PING_INTERVAL, self._loop_pong_check)
+        else:
+            if self._next_ping:
+                self._next_ping.cancel()
+
+            if self._next_pong_check:
+                self._next_pong_check.cancel()
 
 
-class KiteTickerClientFactory(WebSocketClientFactory, ReconnectingClientFactory):
+class KiteTickerClientFactory(WebSocketClientFactory):
     """Autobahn WebSocket client factory to implement reconnection and custom callbacks."""
 
     protocol = KiteTickerClientProtocol
-    maxDelay = 5
-    maxRetries = 10
-
-    _last_connection_time = None
+    max_delay = 5
+    max_retries = 10
 
     def __init__(self, *args, **kwargs):
         """Initialize with default callback method values."""
@@ -159,16 +182,22 @@ class KiteTickerClientFactory(WebSocketClientFactory, ReconnectingClientFactory)
         self.on_reconnect = None
         self.on_noreconnect = None
 
+        self.retries = 0
+        self.delay = 0
+        self._is_closing = False
+
+        self.set_reconnect(True or kwargs.get("reconnect"))
+
+        kwargs["loop"] = asyncio.get_event_loop()
+
         super(KiteTickerClientFactory, self).__init__(*args, **kwargs)
 
-    def startedConnecting(self, connector):  # noqa
+    def started_connecting(self):  # noqa
         """On connecting start or reconnection."""
-        if not self._last_connection_time and self.debug:
+        if self.debug:
             log.debug("Start WebSocket connection.")
 
-        self._last_connection_time = time.time()
-
-    def clientConnectionFailed(self, connector, reason):  # noqa
+    def client_connection_failed(self, reason):  # noqa
         """On connection failure (When connect request fails)"""
         if self.retries > 0:
             log.error("Retrying connection. Retry attempt count: {}. Next retry in around: {} seconds".format(self.retries, int(round(self.delay))))
@@ -178,28 +207,76 @@ class KiteTickerClientFactory(WebSocketClientFactory, ReconnectingClientFactory)
                 self.on_reconnect(self.retries)
 
         # Retry the connection
-        self.retry(connector)
-        self.send_noreconnect()
-
-    def clientConnectionLost(self, connector, reason):  # noqa
-        """On connection lost (When ongoing connection got disconnected)."""
-        if self.retries > 0:
-            # on reconnect callback
-            if self.on_reconnect:
-                self.on_reconnect(self.retries)
-
-        # Retry the connection
-        self.retry(connector)
+        # self.retry(connector)
         self.send_noreconnect()
 
     def send_noreconnect(self):
         """Callback `no_reconnect` if max retries are exhausted."""
-        if self.maxRetries is not None and (self.retries > self.maxRetries):
-            if self.debug:
-                log.debug("Maximum retries ({}) exhausted.".format(self.maxRetries))
+        if self.on_noreconnect:
+            self.on_noreconnect()
 
-            if self.on_noreconnect:
-                self.on_noreconnect()
+    def stop(self, *args):
+        if self.loop:
+            self.loop.stop()
+
+        self._is_closing = True
+
+    def reset_delay(self):
+        self.delay = 0
+        self.retries = 0
+        self._is_closing = False
+
+    def set_reconnect(self, val):
+        self._is_reconnect = val
+
+    def run(self, ssl=False, reconnect=True):
+        self.reset_delay()
+        self.set_reconnect(reconnect)
+
+        if self.loop.is_closed():
+            self.loop = asyncio.get_event_loop()
+
+        # try:
+        #     self.loop.add_signal_handler(signal.SIGTERM, self.stop)
+        # except NotImplementedError:
+        #     # Ignore if not implemented. Means this program is running in windows.
+        #     pass
+
+        while True:
+            coro = self.loop.create_connection(self, self.host, self.port, ssl=ssl)
+
+            # calculate next delay
+            self.retries += 1
+            self.delay = (2 ** (self.retries)) - 1
+
+            if self.delay > self.max_delay:
+                self.delay = self.max_delay
+
+            try:
+                self.started_connecting()
+                self.loop.run_until_complete(asyncio.wait_for(coro, self.openHandshakeTimeout))
+                self.loop.run_forever()
+            except KeyboardInterrupt:
+                break
+            except asyncio.TimeoutError:
+                self.client_connection_failed("Couldn't connect to server: TimeoutError")
+            except Exception as e:
+                self.client_connection_failed(str(e))
+
+            if self.max_retries is not None and (self.retries > self.max_retries):
+                self.stop()
+                self.send_noreconnect()
+                break
+
+            if self._is_closing:
+                break
+
+            if not self._is_reconnect:
+                break
+
+            self.loop.run_until_complete(asyncio.sleep(self.delay))
+
+        self.loop.close()
 
 
 class KiteTicker(object):
@@ -374,7 +451,7 @@ class KiteTicker(object):
     # Default Reconnect max delay.
     RECONNECT_MAX_DELAY = 60
     # Default reconnect attempts
-    RECONNECT_MAX_TRIES = 50
+    RECONNECT_MAX_TRIES = 10
     # Default root API endpoint. It's possible to
     # override this by passing the `root` parameter during initialisation.
     ROOT_URI = "wss://ws.kite.trade"
@@ -389,9 +466,9 @@ class KiteTicker(object):
 
     # Available actions.
     _message_code = 11
+    _message_setmode = "mode"
     _message_subscribe = "subscribe"
     _message_unsubscribe = "unsubscribe"
-    _message_setmode = "mode"
 
     # Minimum delay which should be set between retries. User can't set less than this
     _minimum_reconnect_max_delay = 5
@@ -448,6 +525,9 @@ class KiteTicker(object):
         # Debug enables logs
         self.debug = debug
 
+        # set auto reconnect
+        self.reconnect = reconnect
+
         # Placeholders for callbacks.
         self.on_ticks = None
         self.on_open = None
@@ -482,8 +562,9 @@ class KiteTicker(object):
         self.factory.on_reconnect = self._on_reconnect
         self.factory.on_noreconnect = self._on_noreconnect
 
-        self.factory.maxDelay = self.reconnect_max_delay
-        self.factory.maxRetries = self.reconnect_max_tries
+        self.factory.max_delay = self.reconnect_max_delay
+        self.factory.max_retries = self.reconnect_max_tries
+        self.factory.is_reconnect = self.reconnect
 
     def _user_agent(self):
         return (__title__ + "-python/").capitalize() + __version__
@@ -506,30 +587,24 @@ class KiteTicker(object):
                                 useragent=self._user_agent(),
                                 proxy=proxy, headers=headers)
 
-        # Set SSL context
-        context_factory = None
+        # # Set SSL context
+        ssl_context = None
         if self.factory.isSecure and not disable_ssl_verification:
-            context_factory = ssl.ClientContextFactory()
+            ssl_context = ssl.create_default_context()
 
-        # Establish WebSocket connection to a server
-        connectWS(self.factory, contextFactory=context_factory, timeout=self.connect_timeout)
-
-        if self.debug:
-            twisted_log.startLogging(sys.stdout)
-
-        # Run in seperate thread of blocking
-        opts = {}
+        opts = {
+            "ssl": ssl_context
+        }
 
         # Run when reactor is not running
-        if not reactor.running:
+        if not self.factory.loop.is_running():
             if threaded:
                 # Signals are not allowed in non main thread by twisted so suppress it.
-                opts["installSignalHandlers"] = False
-                self.websocket_thread = threading.Thread(target=reactor.run, kwargs=opts)
+                self.websocket_thread = threading.Thread(target=self.factory.run, kwargs=opts)
                 self.websocket_thread.daemon = True
                 self.websocket_thread.start()
             else:
-                reactor.run(**opts)
+                self.factory.run(ssl=ssl_context)
 
     def is_connected(self):
         """Check if WebSocket connection is established."""
@@ -552,12 +627,12 @@ class KiteTicker(object):
         """Stop the event loop. Should be used if main thread has to be closed in `on_close` method.
         Reconnection mechanism cannot happen past this method
         """
-        reactor.stop()
+        pass
 
     def stop_retry(self):
         """Stop auto retry when it is in progress."""
         if self.factory:
-            self.factory.stopTrying()
+            self.factory.set_reconnect(False)
 
     def subscribe(self, instrument_tokens):
         """
